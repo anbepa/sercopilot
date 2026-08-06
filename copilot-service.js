@@ -32,8 +32,8 @@ const readline = require('readline');
 // ----------------------------------------------------------------------------
 const CONFIG = {
   url: 'https://copilot.cloud.microsoft/chat',
-  email: process.env.COPILOT_EMAIL || 'aabernal@bancolombia.com.co',
-  password: process.env.COPILOT_PASSWORD || '4517.Tester.4517',
+  email: process.env.COPILOT_EMAIL || 'CAMBIA_ESTE_CORREO@dominio.com',
+  password: process.env.COPILOT_PASSWORD || 'CAMBIA_ESTA_PASSWORD',
   model: process.env.COPILOT_MODEL || 'GPT 5.6 Think deeper',
   browserChannel: 'msedge',   // navegador Microsoft Edge
   headless: false,            // false => ves el navegador (necesario para el token)
@@ -150,7 +150,7 @@ async function handleTokenStep(page) {
   }
 
   console.log('\n============================================================');
-  console.log('  🔐  PASO MANUAL: TOKEN / MFA REQUERIDO');
+  console.log('  PASO MANUAL: TOKEN / MFA REQUERIDO');
   console.log('============================================================');
 
   if (kind === 'app') {
@@ -258,14 +258,14 @@ async function sendMessageAndGetReply(page, message) {
 // ============================================================================
 async function serviceLoop(page) {
   console.log('\n============================================================');
-  console.log('  💬  SERVICIO COPILOT ACTIVO');
+  console.log('  SERVICIO COPILOT ACTIVO');
   console.log('     Escribe tu mensaje y pulsa ENTER.');
   console.log('     /new  -> iniciar un chat nuevo');
   console.log('     /exit -> cerrar el servicio');
   console.log('============================================================\n');
 
   while (true) {
-    const msg = await ask('🗨️  Tú > ');
+    const msg = await ask('Tú > ');
     if (!msg) continue;
     if (msg === '/exit') break;
 
@@ -278,9 +278,9 @@ async function serviceLoop(page) {
     }
 
     try {
-      process.stdout.write('🤖 Copilot está pensando...\n');
+      process.stdout.write('Copilot está pensando...\n');
       const reply = await sendMessageAndGetReply(page, msg);
-      console.log('\n🤖 Copilot >\n' + reply + '\n');
+      console.log('\nCopilot >\n' + reply + '\n');
     } catch (e) {
       warn('Error al obtener respuesta: ' + e.message);
     }
@@ -304,7 +304,7 @@ async function serviceLoop(page) {
       ],
     });
   } catch (e) {
-    console.error('❌ No se pudo iniciar Microsoft Edge.');
+    console.error('No se pudo iniciar Microsoft Edge.');
     console.error('   Asegúrate de tener Edge instalado y ejecuta: npx playwright install msedge');
     console.error('   Detalle:', e.message);
     rl.close();
@@ -336,7 +336,7 @@ async function serviceLoop(page) {
   }
 
   if (!logged) {
-    console.error('❌ No fue posible completar el login tras varios intentos.');
+    console.error('No fue posible completar el login tras varios intentos.');
     await browser.close();
     rl.close();
     process.exit(1);
