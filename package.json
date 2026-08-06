@@ -1,0 +1,21 @@
+{
+  "name": "sercopilot",
+  "version": "1.0.0",
+  "description": "Servicio de automatización para Microsoft 365 Copilot con Playwright + Edge (InPrivate)",
+  "main": "copilot-service.js",
+  "scripts": {
+    "start": "node copilot-service.js"
+  },
+  "keywords": [
+    "playwright",
+    "copilot",
+    "microsoft365",
+    "automation",
+    "edge"
+  ],
+  "author": "anbepa",
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
