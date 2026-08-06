@@ -4,13 +4,17 @@
 //  ---------------------------------------------------------------------------
 //  - Navegador: Microsoft EDGE en modo InPrivate (incógnito) -> SIEMPRE pide login.
 //  - Login automático; ÚNICO paso manual: TOKEN / MFA (tú lo ingresas).
-//  - Maneja la pantalla "Acceso supervisado / Continuar en current browser".
-//  - Captura la respuesta EN DIRECTO usando data-testid REALES del DOM:
-//        copilot-message-div        -> contar respuestas de Copilot
-//        copilot-message-reply-div  -> cuerpo de la respuesta
-//        lastChatMessage            -> última respuesta
-//        loading-message            -> presente mientras hace streaming
-//  - Localizadores robustos + reintentos completos del flujo de login.
+//  - Maneja la pantalla POST-LOGIN "Acceso supervisado" (Defender for Cloud Apps):
+//        "Usar el explorador Edge para obtener un mejor rendimiento..."
+//        checkbox "Ocultar esta notificación... durante una semana"
+//        botón   "Continuar en current browser"
+//  - Captura de respuesta ROBUSTA (corrige el cuelgue en "Copilot está pensando"):
+//        * IMPORTANTE: [data-testid="loading-message"] NO desaparece al terminar;
+//          de hecho CONTIENE el texto de la respuesta y queda visible. Por eso
+//          NO se puede esperar a que se vaya.
+//        * El fin de la respuesta se detecta por ESTABILIZACIÓN del texto de
+//          [data-testid="lastChatMessage"] (varias lecturas iguales) + que el
+//          textbox vuelve a estar editable.
 //
 //  INSTALACIÓN:
 //     npm init -y
@@ -20,7 +24,7 @@
 //  EJECUCIÓN:
 //     node copilot-service.js
 //
-//  (Opcional) Variables de entorno para no dejar credenciales en el archivo:
+//  (Opcional) Variables de entorno:
 //     COPILOT_EMAIL, COPILOT_PASSWORD, COPILOT_MODEL
 // ============================================================================
 
@@ -35,10 +39,12 @@ const CONFIG = {
   email: process.env.COPILOT_EMAIL || 'CAMBIA_ESTE_CORREO@dominio.com',
   password: process.env.COPILOT_PASSWORD || 'CAMBIA_ESTA_PASSWORD',
   model: process.env.COPILOT_MODEL || 'GPT 5.6 Think deeper',
-  browserChannel: 'msedge',   // navegador Microsoft Edge
-  headless: false,            // false => ves el navegador (necesario para el token)
-  loginMaxRetries: 3,         // reintentos completos del flujo de login
-  responseTimeoutMs: 120000,  // espera máx. por una respuesta de Copilot
+  browserChannel: 'msedge',
+  headless: false,
+  loginMaxRetries: 3,
+  responseTimeoutMs: 180000,   // espera máx. total por una respuesta
+  stableReads: 4,              // lecturas iguales para dar por terminada la respuesta
+  stableIntervalMs: 700,       // intervalo entre lecturas de estabilización
 };
 
 // ----------------------------------------------------------------------------
@@ -58,10 +64,9 @@ async function doLogin(page) {
   log('Navegando a Copilot...');
   await page.goto(CONFIG.url, { waitUntil: 'domcontentloaded' });
 
-  // Puede aparecer "Acceso supervisado" ANTES del login.
+  // "Acceso supervisado" puede aparecer ANTES del login.
   await handleSupervisedAccess(page);
 
-  // En InPrivate SIEMPRE aparece el formulario de login.
   const emailBox = page.getByRole('textbox', { name: /correo|email|someone@example|usuario/i })
     .or(page.locator('input[type="email"]'))
     .or(page.locator('input[name="loginfmt"]'));
@@ -69,7 +74,6 @@ async function doLogin(page) {
   try {
     await emailBox.first().waitFor({ state: 'visible', timeout: 45000 });
   } catch {
-    // Por si hubo otra pantalla de acceso supervisado en medio.
     await handleSupervisedAccess(page);
     await emailBox.first().waitFor({ state: 'visible', timeout: 30000 });
   }
@@ -78,7 +82,6 @@ async function doLogin(page) {
   await emailBox.first().fill(CONFIG.email);
   await clickBtn(page, /^siguiente$|^next$/i);
 
-  // "Usar su contraseña en su lugar" (no siempre aparece).
   const usePassword = page.getByRole('button', { name: /use su contraseña|usar (mi|su) contraseña|use.*password/i })
     .or(page.getByRole('link', { name: /use su contraseña|use.*password/i }));
   if (await usePassword.first().isVisible({ timeout: 6000 }).catch(() => false)) {
@@ -86,7 +89,6 @@ async function doLogin(page) {
     log('Se seleccionó "Usar su contraseña".');
   }
 
-  // Contraseña.
   const passBox = page.getByRole('textbox', { name: /contraseña|password/i })
     .or(page.locator('input[type="password"]'))
     .or(page.locator('input[name="passwd"]'));
@@ -100,10 +102,10 @@ async function doLogin(page) {
   // "¿Mantener la sesión iniciada?" (KMSI).
   await handleStaySignedIn(page);
 
-  // "Acceso supervisado" también puede salir DESPUÉS del login.
+  // "Acceso supervisado" también aparece DESPUÉS del login (caso confirmado).
   await handleSupervisedAccess(page);
 
-  // Confirmar llegada a Copilot.
+  // Confirmar llegada a Copilot (el dominio puede venir con sufijo .mcas.ms).
   await page.waitForURL(/m365\.cloud\.microsoft|copilot\.cloud\.microsoft/i, { timeout: 60000 });
   await page.getByRole('textbox', { name: /enviar un mensaje a copilot|message copilot/i })
     .first().waitFor({ state: 'visible', timeout: 60000 });
@@ -111,21 +113,39 @@ async function doLogin(page) {
   ok('Login completado. Copilot está listo.');
 }
 
-// Botón genérico tolerante a idioma (con fallback al id clásico de Azure AD).
 async function clickBtn(page, nameRe) {
   const btn = page.getByRole('button', { name: nameRe }).or(page.locator('#idSIButton9'));
   await btn.first().click();
 }
 
-// Pantalla "Acceso supervisado / Continuar en current browser" (Defender for Cloud Apps).
+// ----------------------------------------------------------------------------
+//  Pantalla "Acceso supervisado" (Microsoft Defender for Cloud Apps)
+//  Verificada en vivo:
+//    heading: "Usar el explorador Edge para obtener un mejor rendimiento..."
+//    checkbox: "Ocultar esta notificación en todas las aplicaciones durante una semana"
+//    button:  "Continuar en current browser"
+//  Al pulsar el botón -> redirige a M365 Copilot.
+// ----------------------------------------------------------------------------
 async function handleSupervisedAccess(page) {
   const continueBtn = page.getByRole('button', {
     name: /continuar en current browser|continuar en el explorador|continue.*browser/i,
   });
-  if (await continueBtn.first().isVisible({ timeout: 6000 }).catch(() => false)) {
+
+  if (await continueBtn.first().isVisible({ timeout: 8000 }).catch(() => false)) {
+    // Marcar el checkbox para que NO vuelva a salir durante una semana.
+    const hideCheck = page.getByRole('checkbox', {
+      name: /ocultar esta notificaci[oó]n|hide this notification/i,
+    });
+    if (await hideCheck.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+      await hideCheck.first().check().catch(() => {});
+      log('Acceso supervisado: se marcó "Ocultar notificación por una semana".');
+    }
+
     await continueBtn.first().click();
     log('Acceso supervisado: se continuó en el navegador actual.');
-    await page.waitForTimeout(1500);
+    // Esperar la navegación a M365 Copilot.
+    await page.waitForURL(/m365\.cloud\.microsoft|copilot\.cloud\.microsoft/i, { timeout: 30000 })
+      .catch(() => page.waitForTimeout(2000));
   }
 }
 
@@ -164,7 +184,6 @@ async function handleTokenStep(page) {
   ok('Token procesado.');
 }
 
-// "¿Mantener la sesión iniciada?"
 async function handleStaySignedIn(page) {
   const kmsiText = page.getByText(/mantener la sesión iniciada|stay signed in|reducir.*inicios de sesión/i);
   if (await kmsiText.first().isVisible({ timeout: 6000 }).catch(() => false)) {
@@ -174,14 +193,13 @@ async function handleStaySignedIn(page) {
 }
 
 // ============================================================================
-//  SELECCIÓN DE MODELO  (Selector de modelos -> submenú GPT -> variante)
+//  SELECCIÓN DE MODELO
 // ============================================================================
 async function selectModel(page, modelName) {
   try {
     const selector = page.getByRole('button', { name: /selector de modelos|model picker|pick a model/i });
     await selector.first().click();
 
-    // ¿El modelo está directo en el menú principal?
     const directItem = page.getByRole('menuitemradio', { name: new RegExp(escapeRe(modelName), 'i') });
     if (await directItem.first().isVisible({ timeout: 2000 }).catch(() => false)) {
       await directItem.first().click();
@@ -189,7 +207,6 @@ async function selectModel(page, modelName) {
       return;
     }
 
-    // Si no, abrimos el submenú "GPT (OpenAI)".
     const gptEntry = page.getByRole('menuitem', { name: /^gpt/i })
       .or(page.locator('[data-test-id="gptSubMenuModelTrigger-OpenAI"]'));
     await gptEntry.first().click();
@@ -205,16 +222,20 @@ async function selectModel(page, modelName) {
 }
 
 // ============================================================================
-//  ENVIAR MENSAJE Y CAPTURAR RESPUESTA  (localizadores data-testid reales)
+//  ENVIAR MENSAJE Y CAPTURAR RESPUESTA
+//  ---------------------------------------------------------------------------
+//  CORRECCIÓN CLAVE (verificada en vivo):
+//   - NO esperar a que desaparezca [data-testid="loading-message"]: ese elemento
+//     permanece visible y CONTIENE el texto final -> causaba el cuelgue infinito.
+//   - Estrategia correcta: esperar a que aparezca una nueva respuesta y luego
+//     esperar a que su TEXTO se ESTABILICE (deje de crecer) durante N lecturas.
 // ============================================================================
 async function sendMessageAndGetReply(page, message) {
   const input = page.getByRole('textbox', { name: /enviar un mensaje a copilot|message copilot/i });
   await input.first().click();
   await input.first().fill(message);
 
-  // Contamos las respuestas de Copilot ANTES de enviar.
   const before = await page.locator('[data-testid="copilot-message-div"]').count();
-
   await input.first().press('Enter');
 
   // 1) Esperar a que aparezca una NUEVA respuesta de Copilot.
@@ -224,32 +245,36 @@ async function sendMessageAndGetReply(page, message) {
     { timeout: CONFIG.responseTimeoutMs }
   );
 
-  // 2) Esperar a que TERMINE el streaming: el "loading-message" desaparece.
-  await page.waitForFunction(
-    () => !document.querySelector('[data-testid="loading-message"]'),
-    undefined,
-    { timeout: CONFIG.responseTimeoutMs }
-  ).catch(() => { /* si el loader nunca aparece, continuamos */ });
-
-  // 3) Estabilización final del texto de la ÚLTIMA respuesta.
+  // 2) Esperar ESTABILIZACIÓN del texto de la última respuesta.
   const lastReply = page.locator('[data-testid="lastChatMessage"]').last()
     .or(page.locator('[data-testid="copilot-message-reply-div"]').last());
 
   let last = '';
   let stable = 0;
   const start = Date.now();
+
   while (Date.now() - start < CONFIG.responseTimeoutMs) {
     const current = (await lastReply.first().innerText().catch(() => '')) || '';
+
+    // ¿El textbox volvió a estar editable? (señal extra de "terminó").
+    const editable = await page.evaluate(() => {
+      const tb = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea');
+      return tb ? tb.getAttribute('aria-disabled') !== 'true' : true;
+    }).catch(() => true);
+
     if (current && current === last) {
-      if (++stable >= 3) break; // 3 lecturas iguales => streaming terminado
+      stable++;
+      // Terminamos si hay texto estable N veces Y el input está listo.
+      if (stable >= CONFIG.stableReads && editable) break;
     } else {
       stable = 0;
     }
+
     last = current;
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(CONFIG.stableIntervalMs);
   }
 
-  // Limpiar el encabezado "Copilot said:" que trae el reply-div.
+  // Limpiar posible prefijo "Copilot said/dijo:".
   return last.replace(/^\s*copilot (said|dijo):?\s*/i, '').trim();
 }
 
@@ -272,7 +297,7 @@ async function serviceLoop(page) {
     if (msg === '/new') {
       const nuevo = page.getByRole('link', { name: /nuevo chat|new chat/i });
       await nuevo.first().click().catch(() => {});
-      await selectModel(page, CONFIG.model); // re-aplica el modelo en el chat nuevo
+      await selectModel(page, CONFIG.model);
       ok('Nuevo chat iniciado.');
       continue;
     }
@@ -294,32 +319,22 @@ async function serviceLoop(page) {
   let browser;
   try {
     browser = await chromium.launch({
-      channel: CONFIG.browserChannel, // 'msedge'
+      channel: CONFIG.browserChannel,
       headless: CONFIG.headless,
-      args: [
-        '--inprivate',              // MODO INPRIVATE (incógnito) de EDGE
-        '--guest',                  // refuerza: sin perfil ni datos guardados
-        '--no-first-run',
-        '--no-default-browser-check',
-      ],
+      args: ['--inprivate', '--guest', '--no-first-run', '--no-default-browser-check'],
     });
   } catch (e) {
     console.error('No se pudo iniciar Microsoft Edge.');
-    console.error('   Asegúrate de tener Edge instalado y ejecuta: npx playwright install msedge');
+    console.error('   Ejecuta: npx playwright install msedge');
     console.error('   Detalle:', e.message);
     rl.close();
     process.exit(1);
   }
 
-  // Contexto EFÍMERO y SIN estado (incógnito puro).
-  const context = await browser.newContext({
-    storageState: undefined,   // sin cookies/tokens previos
-    ignoreHTTPSErrors: true,
-  });
+  const context = await browser.newContext({ storageState: undefined, ignoreHTTPSErrors: true });
   await context.clearCookies().catch(() => {});
   const page = await context.newPage();
 
-  // --- Login con reintentos del flujo completo ---
   let logged = false;
   for (let attempt = 1; attempt <= CONFIG.loginMaxRetries && !logged; attempt++) {
     try {
@@ -342,13 +357,9 @@ async function serviceLoop(page) {
     process.exit(1);
   }
 
-  // --- Selección de modelo ---
   await selectModel(page, CONFIG.model);
-
-  // --- Servicio interactivo ---
   await serviceLoop(page);
 
-  // --- Cierre ---
   ok('Cerrando servicio...');
   await browser.close();
   rl.close();
