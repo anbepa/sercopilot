@@ -4,17 +4,20 @@
 //  ---------------------------------------------------------------------------
 //  - Navegador: Microsoft EDGE en modo InPrivate (incógnito) -> SIEMPRE pide login.
 //  - Login automático; ÚNICO paso manual: TOKEN / MFA (tú lo ingresas).
-//  - Maneja la pantalla POST-LOGIN "Acceso supervisado" (Defender for Cloud Apps):
-//        "Usar el explorador Edge para obtener un mejor rendimiento..."
-//        checkbox "Ocultar esta notificación... durante una semana"
-//        botón   "Continuar en current browser"
+//  - Maneja MÚLTIPLES pantallas del flujo (todas verificadas en vivo):
+//        1) "Selección de la cuenta" (cuenta recordada) o formulario de correo.
+//        2) "Escribir contraseña".
+//        3) TOKEN / MFA (único paso manual).
+//        4) POST-TOKEN: "Inicie sesión con la cuenta profesional" (sync de perfil
+//           de Edge) -> botón "Continuar con el perfil actual".  <-- NUEVO
+//        5) "¿Mantener la sesión iniciada?" (KMSI).
+//        6) "Acceso supervisado" (Defender for Cloud Apps) ->
+//           checkbox "Ocultar notificación una semana" + "Continuar en current browser".
 //  - Captura de respuesta ROBUSTA (corrige el cuelgue en "Copilot está pensando"):
-//        * IMPORTANTE: [data-testid="loading-message"] NO desaparece al terminar;
-//          de hecho CONTIENE el texto de la respuesta y queda visible. Por eso
-//          NO se puede esperar a que se vaya.
-//        * El fin de la respuesta se detecta por ESTABILIZACIÓN del texto de
-//          [data-testid="lastChatMessage"] (varias lecturas iguales) + que el
-//          textbox vuelve a estar editable.
+//        * [data-testid="loading-message"] NO desaparece al terminar; CONTIENE el
+//          texto de la respuesta y queda visible. NO se puede esperar a que se vaya.
+//        * El fin se detecta por ESTABILIZACIÓN del texto de
+//          [data-testid="lastChatMessage"] + textbox editable de nuevo.
 //
 //  INSTALACIÓN:
 //     npm init -y
@@ -67,37 +70,20 @@ async function doLogin(page) {
   // "Acceso supervisado" puede aparecer ANTES del login.
   await handleSupervisedAccess(page);
 
-  const emailBox = page.getByRole('textbox', { name: /correo|email|someone@example|usuario/i })
-    .or(page.locator('input[type="email"]'))
-    .or(page.locator('input[name="loginfmt"]'));
+  // La cuenta puede estar recordada -> pantalla "Selección de la cuenta".
+  await handleAccountPicker(page);
 
-  try {
-    await emailBox.first().waitFor({ state: 'visible', timeout: 45000 });
-  } catch {
-    await handleSupervisedAccess(page);
-    await emailBox.first().waitFor({ state: 'visible', timeout: 30000 });
-  }
+  // Si no hubo cuenta recordada, aparece el formulario de correo.
+  await handleEmailStep(page);
 
-  log('Formulario de login detectado. Ingresando credenciales...');
-  await emailBox.first().fill(CONFIG.email);
-  await clickBtn(page, /^siguiente$|^next$/i);
-
-  const usePassword = page.getByRole('button', { name: /use su contraseña|usar (mi|su) contraseña|use.*password/i })
-    .or(page.getByRole('link', { name: /use su contraseña|use.*password/i }));
-  if (await usePassword.first().isVisible({ timeout: 6000 }).catch(() => false)) {
-    await usePassword.first().click();
-    log('Se seleccionó "Usar su contraseña".');
-  }
-
-  const passBox = page.getByRole('textbox', { name: /contraseña|password/i })
-    .or(page.locator('input[type="password"]'))
-    .or(page.locator('input[name="passwd"]'));
-  await passBox.first().waitFor({ state: 'visible', timeout: 30000 });
-  await passBox.first().fill(CONFIG.password);
-  await clickBtn(page, /iniciar sesión|sign in|^siguiente$|^next$/i);
+  // Contraseña.
+  await handlePasswordStep(page);
 
   // TOKEN / MFA -> ÚNICO PASO MANUAL.
   await handleTokenStep(page);
+
+  // POST-TOKEN: "Inicie sesión con la cuenta profesional" (sync perfil Edge).
+  await handleEdgeProfileSync(page);
 
   // "¿Mantener la sesión iniciada?" (KMSI).
   await handleStaySignedIn(page);
@@ -119,37 +105,71 @@ async function clickBtn(page, nameRe) {
 }
 
 // ----------------------------------------------------------------------------
-//  Pantalla "Acceso supervisado" (Microsoft Defender for Cloud Apps)
-//  Verificada en vivo:
-//    heading: "Usar el explorador Edge para obtener un mejor rendimiento..."
-//    checkbox: "Ocultar esta notificación en todas las aplicaciones durante una semana"
-//    button:  "Continuar en current browser"
-//  Al pulsar el botón -> redirige a M365 Copilot.
+//  Pantalla "Selección de la cuenta" (cuenta recordada).
+//  Verificada en vivo: heading "Selección de la cuenta" + botón con el correo.
+//  Si aparece, se hace clic en la cuenta configurada; si no está, "Usar otra cuenta".
 // ----------------------------------------------------------------------------
-async function handleSupervisedAccess(page) {
-  const continueBtn = page.getByRole('button', {
-    name: /continuar en current browser|continuar en el explorador|continue.*browser/i,
-  });
+async function handleAccountPicker(page) {
+  const picker = page.getByRole('heading', { name: /selecci[oó]n de la cuenta|pick an account/i });
+  if (!(await picker.first().isVisible({ timeout: 6000 }).catch(() => false))) return;
 
-  if (await continueBtn.first().isVisible({ timeout: 8000 }).catch(() => false)) {
-    // Marcar el checkbox para que NO vuelva a salir durante una semana.
-    const hideCheck = page.getByRole('checkbox', {
-      name: /ocultar esta notificaci[oó]n|hide this notification/i,
-    });
-    if (await hideCheck.first().isVisible({ timeout: 2000 }).catch(() => false)) {
-      await hideCheck.first().check().catch(() => {});
-      log('Acceso supervisado: se marcó "Ocultar notificación por una semana".');
-    }
+  const acct = page.getByRole('button', { name: new RegExp(escapeRe(CONFIG.email), 'i') });
+  if (await acct.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+    await acct.first().click();
+    log(`Selección de cuenta: se eligió ${CONFIG.email}.`);
+    return;
+  }
 
-    await continueBtn.first().click();
-    log('Acceso supervisado: se continuó en el navegador actual.');
-    // Esperar la navegación a M365 Copilot.
-    await page.waitForURL(/m365\.cloud\.microsoft|copilot\.cloud\.microsoft/i, { timeout: 30000 })
-      .catch(() => page.waitForTimeout(2000));
+  const other = page.getByRole('button', { name: /usar otra cuenta|use another account/i });
+  if (await other.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+    await other.first().click();
+    log('Selección de cuenta: se eligió "Usar otra cuenta".');
   }
 }
 
-// Paso del TOKEN / OTP / MFA (único paso manual).
+// ----------------------------------------------------------------------------
+//  Formulario de correo (solo si no hubo cuenta recordada).
+// ----------------------------------------------------------------------------
+async function handleEmailStep(page) {
+  const emailBox = page.getByRole('textbox', { name: /correo|email|someone@example|usuario/i })
+    .or(page.locator('input[type="email"]'))
+    .or(page.locator('input[name="loginfmt"]'));
+
+  if (!(await emailBox.first().isVisible({ timeout: 6000 }).catch(() => false))) return;
+
+  // Si el campo ya trae el correo (readonly en pantalla de contraseña), no re-escribir.
+  const val = await emailBox.first().inputValue().catch(() => '');
+  if (val && val.includes('@')) return;
+
+  log('Formulario de correo detectado. Ingresando correo...');
+  await emailBox.first().fill(CONFIG.email);
+  await clickBtn(page, /^siguiente$|^next$/i);
+}
+
+// ----------------------------------------------------------------------------
+//  Pantalla "Escribir contraseña".
+//  Verificada en vivo: heading "Escribir contraseña" + textbox de contraseña
+//  + enlace "Use una aplicación en su lugar".
+// ----------------------------------------------------------------------------
+async function handlePasswordStep(page) {
+  const usePassword = page.getByRole('button', { name: /use su contraseña|usar (mi|su) contraseña|use.*password/i })
+    .or(page.getByRole('link', { name: /use su contraseña|use.*password/i }));
+  if (await usePassword.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+    await usePassword.first().click();
+    log('Se seleccionó "Usar su contraseña".');
+  }
+
+  const passBox = page.getByRole('textbox', { name: /escriba la contraseña|contraseña|password/i })
+    .or(page.locator('input[type="password"]'))
+    .or(page.locator('input[name="passwd"]'));
+  await passBox.first().waitFor({ state: 'visible', timeout: 30000 });
+  await passBox.first().fill(CONFIG.password);
+  await clickBtn(page, /iniciar sesión|sign in|^siguiente$|^next$/i);
+}
+
+// ----------------------------------------------------------------------------
+//  Paso del TOKEN / OTP / MFA (único paso manual).
+// ----------------------------------------------------------------------------
 async function handleTokenStep(page) {
   const otpInput = page.getByRole('textbox', { name: /código|code|verification|otp/i })
     .or(page.locator('input[name="otc"]'))
@@ -160,8 +180,8 @@ async function handleTokenStep(page) {
   );
 
   const kind = await Promise.race([
-    otpInput.first().waitFor({ state: 'visible', timeout: 8000 }).then(() => 'otp').catch(() => null),
-    authenticatorText.first().waitFor({ state: 'visible', timeout: 8000 }).then(() => 'app').catch(() => null),
+    otpInput.first().waitFor({ state: 'visible', timeout: 10000 }).then(() => 'otp').catch(() => null),
+    authenticatorText.first().waitFor({ state: 'visible', timeout: 10000 }).then(() => 'app').catch(() => null),
   ]);
 
   if (!kind) {
@@ -184,11 +204,77 @@ async function handleTokenStep(page) {
   ok('Token procesado.');
 }
 
+// ----------------------------------------------------------------------------
+//  POST-TOKEN: "Inicie sesión con la cuenta profesional" (sincronización de
+//  perfil de Microsoft Edge). Texto exacto (verificado por el usuario):
+//    "Para obtener la mejor experiencia de exploración al acceder a un servicio,
+//     una aplicación o un sitio web, le recomendamos que inicies sesión en su
+//     perfil del explorador Microsoft Edge con <correo>. Cuando se usa el perfil
+//     de trabajo del explorador, la organización puede ver algunos de sus datos."
+//  ACCIÓN REQUERIDA: pulsar "Continuar con el perfil actual".
+//  (No queremos sincronizar el perfil corporativo de Edge: usamos el actual.)
+// ----------------------------------------------------------------------------
+async function handleEdgeProfileSync(page) {
+  // El botón puede aparecer con distintas variantes de texto según idioma/versión.
+  const continueCurrent = page.getByRole('button', {
+    name: /continuar con el perfil actual|continue without.*profile|seguir con el perfil actual|current profile/i,
+  }).or(page.getByRole('link', {
+    name: /continuar con el perfil actual|seguir con el perfil actual/i,
+  }));
+
+  // Esperar por el heading característico para no confundir con otras pantallas.
+  const heading = page.getByText(/inicie sesión con la cuenta profesional|sign in with your work account/i);
+
+  const appeared = await Promise.race([
+    continueCurrent.first().waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false),
+    heading.first().waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false),
+  ]);
+
+  if (!appeared) return; // No apareció: seguimos.
+
+  if (await continueCurrent.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+    await continueCurrent.first().click();
+    log('Sync de perfil Edge: se pulsó "Continuar con el perfil actual".');
+    // Dar un momento a la navegación posterior.
+    await page.waitForTimeout(1500);
+  } else {
+    warn('Pantalla de sync de perfil detectada, pero no se encontró el botón "Continuar con el perfil actual".');
+  }
+}
+
 async function handleStaySignedIn(page) {
   const kmsiText = page.getByText(/mantener la sesión iniciada|stay signed in|reducir.*inicios de sesión/i);
   if (await kmsiText.first().isVisible({ timeout: 6000 }).catch(() => false)) {
     await clickBtn(page, /^sí$|^yes$/i);
     log('KMSI: se mantuvo la sesión iniciada.');
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  Pantalla "Acceso supervisado" (Microsoft Defender for Cloud Apps).
+//  Verificada en vivo:
+//    heading: "Usar el explorador Edge para obtener un mejor rendimiento..."
+//    checkbox: "Ocultar esta notificación en todas las aplicaciones durante una semana"
+//    button:  "Continuar en current browser"
+// ----------------------------------------------------------------------------
+async function handleSupervisedAccess(page) {
+  const continueBtn = page.getByRole('button', {
+    name: /continuar en current browser|continuar en el explorador|continue.*browser/i,
+  });
+
+  if (await continueBtn.first().isVisible({ timeout: 8000 }).catch(() => false)) {
+    const hideCheck = page.getByRole('checkbox', {
+      name: /ocultar esta notificaci[oó]n|hide this notification/i,
+    });
+    if (await hideCheck.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+      await hideCheck.first().check().catch(() => {});
+      log('Acceso supervisado: se marcó "Ocultar notificación por una semana".');
+    }
+
+    await continueBtn.first().click();
+    log('Acceso supervisado: se continuó en el navegador actual.');
+    await page.waitForURL(/m365\.cloud\.microsoft|copilot\.cloud\.microsoft/i, { timeout: 30000 })
+      .catch(() => page.waitForTimeout(2000));
   }
 }
 
@@ -256,7 +342,6 @@ async function sendMessageAndGetReply(page, message) {
   while (Date.now() - start < CONFIG.responseTimeoutMs) {
     const current = (await lastReply.first().innerText().catch(() => '')) || '';
 
-    // ¿El textbox volvió a estar editable? (señal extra de "terminó").
     const editable = await page.evaluate(() => {
       const tb = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea');
       return tb ? tb.getAttribute('aria-disabled') !== 'true' : true;
@@ -264,7 +349,6 @@ async function sendMessageAndGetReply(page, message) {
 
     if (current && current === last) {
       stable++;
-      // Terminamos si hay texto estable N veces Y el input está listo.
       if (stable >= CONFIG.stableReads && editable) break;
     } else {
       stable = 0;
@@ -274,7 +358,6 @@ async function sendMessageAndGetReply(page, message) {
     await page.waitForTimeout(CONFIG.stableIntervalMs);
   }
 
-  // Limpiar posible prefijo "Copilot said/dijo:".
   return last.replace(/^\s*copilot (said|dijo):?\s*/i, '').trim();
 }
 
